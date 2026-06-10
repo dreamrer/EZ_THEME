@@ -137,12 +137,13 @@ class Patcher:
             self.skipped.append(label or field)
 
     def set_number(self, field: str, value: Any, label: str = "") -> None:
-        """替换 field: <num> → field: <new>"""
+        """替换 field: <num|null> → field: <new>"""
         try:
             num = int(float(value))
         except (TypeError, ValueError):
             return
-        pattern = rf"({field}\s*:\s*)-?\d+(?:\.\d+)?"
+        # 兼容 null 默认值
+        pattern = rf"({field}\s*:\s*)(?:-?\d+(?:\.\d+)?|null)"
         new_content, n = re.subn(
             pattern, rf"\g<1>{num}", self.content, count=1
         )
@@ -162,6 +163,29 @@ class Patcher:
             pattern, lambda m: f"{m.group(1)}{pretty}",
             self.content, count=1, flags=re.DOTALL,
         )
+        if n > 0:
+            self.content = new_content
+            self.count += 1
+        else:
+            self.skipped.append(label or field)
+
+    def set_html_string(self, field: str, value: Any, label: str = "") -> None:
+        """替换 field 的值字符串 — 支持双引号 (HTML 内容常用)"""
+        if value is None or value == "":
+            return
+        # 双引号优先 (HTML 里有单引号)
+        pattern_d = rf"({field}\s*:\s*)\"(?:[^\"\\]|\\.)*\""
+        new_content, n = re.subn(
+            pattern_d, lambda m: f"{m.group(1)}{js_double_string(value)}",
+            self.content, count=1, flags=re.DOTALL,
+        )
+        if n == 0:
+            # 退回单引号
+            pattern_s = rf"({field}\s*:\s*)'(?:[^'\\]|\\.)*'"
+            new_content, n = re.subn(
+                pattern_s, lambda m: f"{m.group(1)}{js_string(value)}",
+                self.content, count=1, flags=re.DOTALL,
+            )
         if n > 0:
             self.content = new_content
             self.count += 1
@@ -248,6 +272,14 @@ def render(payload: dict, input_path: str, output_path: str) -> None:
     site = payload.get("site") or {}
     p.set_string("siteName", site.get("name"), label="site.name")
     p.set_string("siteDescription", site.get("description"), label="site.description")
+    if site.get("copyright"):
+        # copyright 字段值是 template literal `${new Date()...}`, 替成普通字符串
+        p.content = re.sub(
+            r"(copyright\s*:\s*)`[^`]*`",
+            rf"\1{js_string(site['copyright'])}",
+            p.content, count=1,
+        )
+        p.count += 1
     # logo_url 走 workflow 下载到 public/logo.png, 这里不动 config
 
     # ─── Card 2: 面板 & API ──────────────────────────────
@@ -345,6 +377,14 @@ def render(payload: dict, input_path: str, output_path: str) -> None:
         p.set_bool("showHotSaleBadge", shop["show_hot_sale_badge"], label="SHOP_CONFIG.showHotSaleBadge")
     if "auto_select_max_period" in shop:
         p.set_bool("autoSelectMaxPeriod", shop["auto_select_max_period"], label="SHOP_CONFIG.autoSelectMaxPeriod")
+    if "show_plan_feature_cards" in shop:
+        p.set_bool("showPlanFeatureCards", shop["show_plan_feature_cards"], label="SHOP_CONFIG.showPlanFeatureCards")
+    if "hide_period_tabs" in shop:
+        p.set_bool("hidePeriodTabs", shop["hide_period_tabs"], label="SHOP_CONFIG.hidePeriodTabs")
+    if shop.get("low_stock_threshold"):
+        p.set_number("lowStockThreshold", shop["low_stock_threshold"], label="SHOP_CONFIG.lowStockThreshold")
+    if "enable_discount_calculation" in shop:
+        p.set_bool("enableDiscountCalculation", shop["enable_discount_calculation"], label="SHOP_CONFIG.enableDiscountCalculation")
 
     # ─── Card 14: 商店弹窗 ───────────────────────────────
     if any(k in shop for k in ("popup_enabled", "popup_title", "popup_content")):
@@ -364,15 +404,39 @@ def render(payload: dict, input_path: str, output_path: str) -> None:
         p.set_bool("showUserEmail", dashboard["show_user_email"], label="DASHBOARD_CONFIG.showUserEmail")
     if "enable_reset_traffic" in dashboard:
         p.set_bool("enableResetTraffic", dashboard["enable_reset_traffic"], label="DASHBOARD_CONFIG.enableResetTraffic")
+    if dashboard.get("reset_traffic_display_mode"):
+        p.set_string("resetTrafficDisplayMode", dashboard["reset_traffic_display_mode"], label="DASHBOARD_CONFIG.resetTrafficDisplayMode")
+    if dashboard.get("low_traffic_threshold"):
+        p.set_number("lowTrafficThreshold", dashboard["low_traffic_threshold"], label="DASHBOARD_CONFIG.lowTrafficThreshold")
     if "enable_renew_plan" in dashboard:
         p.set_bool("enableRenewPlan", dashboard["enable_renew_plan"], label="DASHBOARD_CONFIG.enableRenewPlan")
+    if dashboard.get("renew_plan_display_mode"):
+        p.set_string("renewPlanDisplayMode", dashboard["renew_plan_display_mode"], label="DASHBOARD_CONFIG.renewPlanDisplayMode")
+    if dashboard.get("expiring_threshold"):
+        p.set_number("expiringThreshold", dashboard["expiring_threshold"], label="DASHBOARD_CONFIG.expiringThreshold")
+    if "import_button_highlight" in dashboard:
+        p.set_bool("importButtonHighlightBtnbgcolor", dashboard["import_button_highlight"], label="DASHBOARD_CONFIG.importButtonHighlightBtnbgcolor")
+    if "show_import_subscription" in dashboard:
+        p.set_bool("showImportSubscription", dashboard["show_import_subscription"], label="DASHBOARD_CONFIG.showImportSubscription")
 
-    # ─── Card 16: 工单 / 图床 ────────────────────────────
+    # ─── Card 16: 工单 / 图床 / 弹窗 ────────────────────────────
     ticket = payload.get("ticket") or {}
     if "enable_image" in ticket:
         p.set_bool("isImageHosting", ticket["enable_image"], label="TICKET_CONFIG.isImageHosting")
     if ticket.get("imgbb_api_key"):
         p.set_string("imgbbApiKey", ticket["imgbb_api_key"], label="TICKET_CONFIG.imgbbApiKey")
+    if "include_user_info" in ticket:
+        p.set_bool("includeUserInfoInTicket", ticket["include_user_info"], label="TICKET_CONFIG.includeUserInfoInTicket")
+    if any(k in ticket for k in ("popup_enabled", "popup_title", "popup_content")):
+        p.replace_popup_block(
+            "TICKET_CONFIG",
+            {
+                "enabled": ticket.get("popup_enabled"),
+                "title": ticket.get("popup_title"),
+                "content": ticket.get("popup_content"),
+            },
+            label="TICKET_CONFIG.popup",
+        )
 
     # ─── Card 17: 充值预设 ───────────────────────────────
     wallet = payload.get("wallet") or {}
@@ -382,6 +446,8 @@ def render(payload: dict, input_path: str, output_path: str) -> None:
             p.set_array("presetAmounts", amounts, label="WALLET_CONFIG.presetAmounts")
     if wallet.get("minimum_deposit"):
         p.set_number("minimumDepositAmount", wallet["minimum_deposit"], label="WALLET_CONFIG.minimumDepositAmount")
+    if wallet.get("default_selected"):
+        p.set_number("defaultSelectedAmount", wallet["default_selected"], label="WALLET_CONFIG.defaultSelectedAmount")
 
     # ─── Card 18: 邀请页面 ───────────────────────────────
     invite = payload.get("invite") or {}
@@ -391,6 +457,8 @@ def render(payload: dict, input_path: str, output_path: str) -> None:
         p.set_string("linkMode", invite["link_mode"], label="INVITE_CONFIG.inviteLinkConfig.linkMode")
     if invite.get("custom_domain"):
         p.set_string("customDomain", invite["custom_domain"], label="INVITE_CONFIG.inviteLinkConfig.customDomain")
+    if invite.get("records_per_page"):
+        p.set_number("recordsPerPage", invite["records_per_page"], label="INVITE_CONFIG.recordsPerPage")
 
     # ─── Card 19: API 加密中间件 ─────────────────────────
     if "middleware_enabled" in panel:
@@ -441,6 +509,33 @@ def render(payload: dict, input_path: str, output_path: str) -> None:
         p.set_number("qrcodeSize", payment["qr_size"], label="PAYMENT_CONFIG.qrcodeSize")
     if "auto_check" in payment:
         p.set_bool("autoCheckPayment", payment["auto_check"], label="PAYMENT_CONFIG.autoCheckPayment")
+    if payment.get("auto_check_interval"):
+        p.set_number("autoCheckInterval", payment["auto_check_interval"], label="PAYMENT_CONFIG.autoCheckInterval")
+    if "auto_check_max_times" in payment:
+        p.set_number("autoCheckMaxTimes", payment["auto_check_max_times"], label="PAYMENT_CONFIG.autoCheckMaxTimes")
+
+    # ─── Card 23: ORDER_CONFIG 下单确认 ──────────────────
+    order = payload.get("order") or {}
+    if "confirm_enabled" in order:
+        p.set_bool("confirmOrder", order["confirm_enabled"], label="ORDER_CONFIG.confirmOrder")
+    if order.get("confirm_content"):
+        p.set_html_string("confirmOrderContent", order["confirm_content"], label="ORDER_CONFIG.confirmOrderContent")
+
+    # ─── Card 24: NODES_CONFIG 节点列表 ──────────────────
+    nodes = payload.get("nodes") or {}
+    if "show_rate" in nodes:
+        p.set_bool("showNodeRate", nodes["show_rate"], label="NODES_CONFIG.showNodeRate")
+    if "show_details" in nodes:
+        p.set_bool("showNodeDetails", nodes["show_details"], label="NODES_CONFIG.showNodeDetails")
+    if "allow_view_info" in nodes:
+        p.set_bool("allowViewNodeInfo", nodes["allow_view_info"], label="NODES_CONFIG.allowViewNodeInfo")
+
+    # ─── Card 25: PROFILE_CONFIG 用户中心扩展 ────────────
+    profile = payload.get("profile") or {}
+    if "show_gift_card" in profile:
+        p.set_bool("showGiftCardRedeem", profile["show_gift_card"], label="PROFILE_CONFIG.showGiftCardRedeem")
+    if "show_recent_devices" in profile:
+        p.set_bool("showRecentDevices", profile["show_recent_devices"], label="PROFILE_CONFIG.showRecentDevices")
 
     # ─── 写出 ─────────────────────────────────────────────
     Path(output_path).write_text(p.content, encoding="utf-8")
