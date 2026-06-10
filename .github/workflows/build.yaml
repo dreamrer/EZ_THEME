@@ -1,0 +1,249 @@
+name: Build EZ Theme
+
+# ════════════════════════════════════════════════════════════════════════
+# EZ Theme 主题打包 CI
+#
+# 这个 workflow 部署在 dreamrer/EZ_THEME (你的 fork) 里, 跟主题源码同仓.
+# 上游 codeman9528/EZ_THEME 的 upstream-sync.sh 定期拉新版本.
+#
+# 触发: Go bot 通过 GitHub API workflow_dispatch
+# 流程:
+#   1. HMAC 验签 (拦 fork 滥用)
+#   2. (无需再 checkout 主题源, 当前仓就是)
+#   3. Python 渲染 src/config/index.js (按用户 18 卡答案)
+#   4. 下载用户 logo (若有)
+#   5. npm install + vite build
+#   6. zip + 部署说明.txt
+#   7. 推 zip 到用户 TG
+#
+# 必填 Secrets (本仓库 Settings → Secrets):
+#   BUILD_SECRET   - HMAC 密钥, 32+ 字符
+#   TG_BOT_TOKEN   - 推 zip 用的 TG bot token
+# ════════════════════════════════════════════════════════════════════════
+
+on:
+  workflow_dispatch:
+    inputs:
+      payload:
+        description: '用户配置 JSON (base64 编码)'
+        required: true
+        type: string
+      auth_token:
+        description: 'HMAC-SHA256(BUILD_SECRET, payload)'
+        required: true
+        type: string
+      order_id:
+        description: '订单号 (推 zip 时显示)'
+        required: true
+        type: string
+      user_chat_id:
+        description: 'TG 推送目标 chat_id'
+        required: true
+        type: string
+
+env:
+  NODE_VERSION: '20'
+  PYTHON_VERSION: '3.11'
+
+# 同一订单不并发
+concurrency:
+  group: build-${{ inputs.order_id }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      # ──────────────────────────────────────────────────────────────────
+      # 1. HMAC 鉴权 (核心反 fork 滥用)
+      # ──────────────────────────────────────────────────────────────────
+      - name: 🔐 HMAC 鉴权
+        env:
+          SECRET: ${{ secrets.BUILD_SECRET }}
+          PAYLOAD: ${{ inputs.payload }}
+          PROVIDED_TOKEN: ${{ inputs.auth_token }}
+        run: |
+          if [ -z "$SECRET" ]; then
+            echo "::error::BUILD_SECRET 未配置 — 大概率是 fork 在跑, 直接退出"
+            exit 1
+          fi
+
+          EXPECTED=$(printf '%s' "$PAYLOAD" \
+            | openssl dgst -sha256 -hmac "$SECRET" -hex \
+            | awk '{print $2}')
+
+          if [ "$EXPECTED" != "$PROVIDED_TOKEN" ]; then
+            echo "::error::HMAC 验证失败 — token 跟 payload 不匹配"
+            exit 1
+          fi
+          echo "✅ HMAC 鉴权通过 | 订单: ${{ inputs.order_id }}"
+
+      # ──────────────────────────────────────────────────────────────────
+      # 2. Checkout 当前仓 (含主题源 + render scripts)
+      # ──────────────────────────────────────────────────────────────────
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+
+      # ──────────────────────────────────────────────────────────────────
+      # 3. Setup runtime
+      # ──────────────────────────────────────────────────────────────────
+      - name: 🟢 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: package.json
+
+      - name: 🐍 Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      # ──────────────────────────────────────────────────────────────────
+      # 4. 解码 payload + 渲染配置
+      # ──────────────────────────────────────────────────────────────────
+      - name: 📝 解码 payload
+        env:
+          PAYLOAD: ${{ inputs.payload }}
+        run: |
+          echo "$PAYLOAD" | base64 -d > /tmp/payload.json
+          echo "解码后字段:"
+          jq -r 'keys[]' /tmp/payload.json | sed 's/^/  /'
+
+      - name: 🎨 渲染 config + env
+        run: |
+          python3 scripts/render-config.py \
+            /tmp/payload.json \
+            src/config/index.js \
+            src/config/index.js
+          python3 scripts/render-env.py \
+            /tmp/payload.json \
+            .env.production
+
+      # ──────────────────────────────────────────────────────────────────
+      # 5. 下载用户 logo (若提供)
+      # ──────────────────────────────────────────────────────────────────
+      - name: 🖼 下载 logo
+        run: |
+          LOGO_URL=$(jq -r '.site.logo_url // empty' /tmp/payload.json)
+          if [ -n "$LOGO_URL" ] && [ "$LOGO_URL" != "null" ]; then
+            echo "拉 logo: $LOGO_URL"
+            curl -fsSL --max-time 30 \
+              -o public/logo.png "$LOGO_URL" || {
+              echo "::warning::Logo 下载失败 ($LOGO_URL), 用主题默认 logo"
+            }
+          else
+            echo "用户没传 logo, 用主题默认"
+          fi
+
+      # ──────────────────────────────────────────────────────────────────
+      # 6. 构建
+      # ──────────────────────────────────────────────────────────────────
+      - name: 📦 npm install
+        run: |
+          npm install --prefer-offline --no-audit --no-fund --loglevel=warn
+
+      - name: 🔨 vite build
+        run: |
+          npm run build
+          if [ ! -f dist/index.html ]; then
+            echo "::error::构建失败 - dist/index.html 不存在"
+            exit 1
+          fi
+          du -sh dist/
+
+      # ──────────────────────────────────────────────────────────────────
+      # 7. 生成部署说明 + 打包 zip
+      # ──────────────────────────────────────────────────────────────────
+      - name: 📄 生成部署说明
+        env:
+          ORDER_ID: ${{ inputs.order_id }}
+        run: |
+          python3 scripts/render-readme.py \
+            /tmp/payload.json \
+            "$ORDER_ID" \
+            > dist/部署说明.txt
+
+      - name: 🗜 打包 zip
+        env:
+          ORDER_ID: ${{ inputs.order_id }}
+        run: |
+          SITE_NAME=$(jq -r '.site.name // "ez-theme"' /tmp/payload.json)
+          SAFE_NAME=$(echo "$SITE_NAME" | tr -cd '[:alnum:]_-' | head -c 32)
+          [ -z "$SAFE_NAME" ] && SAFE_NAME="ez-theme"
+
+          ZIP_NAME="EZ_THEME_${SAFE_NAME}_${ORDER_ID}.zip"
+          (cd dist && zip -rq "/tmp/$ZIP_NAME" .)
+
+          echo "ZIP_PATH=/tmp/$ZIP_NAME" >> $GITHUB_ENV
+          echo "ZIP_NAME=$ZIP_NAME" >> $GITHUB_ENV
+          ls -lh "/tmp/$ZIP_NAME"
+
+      # ──────────────────────────────────────────────────────────────────
+      # 8. 推送到 TG
+      # ──────────────────────────────────────────────────────────────────
+      - name: 📤 推 zip 到 Telegram
+        env:
+          BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          CHAT_ID: ${{ inputs.user_chat_id }}
+          ORDER_ID: ${{ inputs.order_id }}
+        run: |
+          if [ -z "$BOT_TOKEN" ]; then
+            echo "::error::TG_BOT_TOKEN 未配置"
+            exit 1
+          fi
+
+          CAPTION="📦 订单 \`${ORDER_ID}\` 打包完成 ✅
+
+          请解压后部署到你的前端 Nginx.
+          详细步骤见 zip 内 \`部署说明.txt\`."
+
+          RESPONSE=$(curl -sf -X POST \
+            -F "document=@${ZIP_PATH}" \
+            -F "chat_id=${CHAT_ID}" \
+            -F "caption=${CAPTION}" \
+            -F "parse_mode=Markdown" \
+            "https://api.telegram.org/bot${BOT_TOKEN}/sendDocument")
+
+          OK=$(echo "$RESPONSE" | jq -r '.ok')
+          if [ "$OK" != "true" ]; then
+            echo "::error::TG 推送失败"
+            echo "$RESPONSE" | jq
+            exit 1
+          fi
+          echo "✅ 已推送给用户 chat_id=${CHAT_ID}"
+
+      # ──────────────────────────────────────────────────────────────────
+      # 9. 备份 artifact (7 天保留)
+      # ──────────────────────────────────────────────────────────────────
+      - name: 💾 保留 artifact (debug 用)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIP_NAME }}
+          path: ${{ env.ZIP_PATH }}
+          retention-days: 7
+          if-no-files-found: ignore
+
+      # ──────────────────────────────────────────────────────────────────
+      # 10. 失败时通知用户
+      # ──────────────────────────────────────────────────────────────────
+      - name: ⚠️ 失败通知
+        if: failure()
+        env:
+          BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          CHAT_ID: ${{ inputs.user_chat_id }}
+          ORDER_ID: ${{ inputs.order_id }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          [ -z "$BOT_TOKEN" ] || [ -z "$CHAT_ID" ] && exit 0
+          curl -sf -X POST \
+            -F "chat_id=${CHAT_ID}" \
+            -F "text=❌ 订单 ${ORDER_ID} 打包失败
+
+          管理员已收到告警, 会人工排查.
+          (Ref: ${RUN_URL})" \
+            "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            > /dev/null
